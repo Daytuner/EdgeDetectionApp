@@ -25,11 +25,27 @@ android {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a")
         }
 
+        // ADD THIS:
+        packaging {
+            jniLibs {
+                useLegacyPackaging = true
+            }
+        }
+
         // CMake arguments
         externalNativeBuild {
             cmake {
                 cppFlags += "-frtti -fexceptions"
                 abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared"  // ← Add this
+                )
+            }
+        }
+
+        sourceSets {
+            getByName("main") {
+                jniLibs.srcDirs("src/main/jniLibs")
             }
         }
 

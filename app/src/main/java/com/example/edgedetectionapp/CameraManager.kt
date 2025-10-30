@@ -1,20 +1,18 @@
 package com.example.edgedetectionapp
 
-import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
-import android.content.pm.PackageManager
-import android.graphics.SurfaceTexture
+import android.graphics.ImageFormat
 import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
-import android.view.Surface
-import android.view.TextureView
-import androidx.core.app.ActivityCompat
+import android.util.Size
 
 class CameraManager(
     private val context: Context,
-    private val textureView: TextureView,
     private val onFrameAvailable: (ByteArray, Int, Int) -> Unit
 ) {
     private val TAG = "CameraManager"
@@ -22,116 +20,172 @@ class CameraManager(
     private var captureSession: CameraCaptureSession? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+    private var imageReader: ImageReader? = null
 
-    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+    private var WIDTH = 640
+    private var HEIGHT = 480
 
+    @SuppressLint("MissingPermission")
     fun startCamera() {
+        Log.d(TAG, "Starting camera...")
         startBackgroundThread()
 
-        if (textureView.isAvailable) {
-            openCamera()
-        } else {
-            textureView.surfaceTextureListener = surfaceTextureListener
-        }
-    }
-
-    fun stopCamera() {
-        captureSession?.close()
-        captureSession = null
-        cameraDevice?.close()
-        cameraDevice = null
-        stopBackgroundThread()
-    }
-
-    private val surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            openCamera()
-        }
-
-        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture) = true
-        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
-    }
-
-    private fun openCamera() {
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "Camera permission not granted")
-            return
-        }
-
         try {
-            val cameraId = cameraManager.cameraIdList[0]
-            Log.d(TAG, "Opening camera: $cameraId")
-            cameraManager.openCamera(cameraId, stateCallback, backgroundHandler)
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+            val cameraId = selectCamera(manager)
+
+            // Get supported sizes
+            val characteristics = manager.getCameraCharacteristics(cameraId)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+
+            // Find best size close to 640x480
+            val targetSize = findBestSize(sizes)
+            WIDTH = targetSize.width
+            HEIGHT = targetSize.height
+
+            Log.d(TAG, "Using camera size: ${WIDTH}x${HEIGHT}")
+
+            imageReader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = reader.acquireLatestImage()
+                    if (image != null) {
+                        try {
+                            val bytes = imageToByteArray(image)
+                            onFrameAvailable(bytes, WIDTH, HEIGHT)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error processing image", e)
+                        } finally {
+                            image.close()
+                        }
+                    }
+                }, backgroundHandler)
+            }
+
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    Log.d(TAG, "Camera opened successfully")
+                    cameraDevice = camera
+                    startCapture()
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    Log.d(TAG, "Camera disconnected")
+                    camera.close()
+                    cameraDevice = null
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    Log.e(TAG, "Camera error: $error")
+                    camera.close()
+                    cameraDevice = null
+                }
+            }, backgroundHandler)
+
         } catch (e: Exception) {
-            Log.e(TAG, "Error opening camera", e)
+            Log.e(TAG, "Failed to start camera", e)
         }
     }
 
-    private val stateCallback = object : CameraDevice.StateCallback() {
-        override fun onOpened(camera: CameraDevice) {
-            Log.d(TAG, "Camera opened successfully")
-            cameraDevice = camera
-            createCameraPreview()
+    private fun selectCamera(manager: android.hardware.camera2.CameraManager): String {
+        for (cameraId in manager.cameraIdList) {
+            val characteristics = manager.getCameraCharacteristics(cameraId)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                return cameraId
+            }
         }
-
-        override fun onDisconnected(camera: CameraDevice) {
-            Log.d(TAG, "Camera disconnected")
-            cameraDevice?.close()
-            cameraDevice = null
-        }
-
-        override fun onError(camera: CameraDevice, error: Int) {
-            Log.e(TAG, "Camera error: $error")
-            cameraDevice?.close()
-            cameraDevice = null
-        }
+        return manager.cameraIdList[0]
     }
 
-    private fun createCameraPreview() {
+    private fun findBestSize(sizes: Array<Size>): Size {
+        // Target 640x480 or closest
+        var bestSize = sizes.firstOrNull() ?: Size(640, 480)
+        var minDiff = Int.MAX_VALUE
+
+        for (size in sizes) {
+            if (size.width <= 1280 && size.height <= 960) {
+                val diff = Math.abs(size.width - 640) + Math.abs(size.height - 480)
+                if (diff < minDiff) {
+                    minDiff = diff
+                    bestSize = size
+                }
+            }
+        }
+
+        return bestSize
+    }
+
+    private fun startCapture() {
         try {
-            val texture = textureView.surfaceTexture ?: return
-            texture.setDefaultBufferSize(640, 480)
+            val surface = imageReader?.surface ?: return
+            val device = cameraDevice ?: return
 
-            val surface = Surface(texture)
-            val captureRequestBuilder = cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            captureRequestBuilder?.addTarget(surface)
+            val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
 
-            cameraDevice?.createCaptureSession(
+            device.createCaptureSession(
                 listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        if (cameraDevice == null) return
                         captureSession = session
-
-                        captureRequestBuilder?.set(
-                            CaptureRequest.CONTROL_MODE,
-                            CameraMetadata.CONTROL_MODE_AUTO
-                        )
-
-                        session.setRepeatingRequest(
-                            captureRequestBuilder?.build()!!,
-                            null,
-                            backgroundHandler
-                        )
-
-                        Log.d(TAG, "Camera preview started")
+                        try {
+                            session.setRepeatingRequest(captureBuilder.build(), null, backgroundHandler)
+                            Log.d(TAG, "Capture session started successfully")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to start repeating request", e)
+                        }
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(TAG, "Camera configuration failed")
+                        Log.e(TAG, "Capture session configuration failed")
                     }
                 },
                 backgroundHandler
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Error creating camera preview", e)
+            Log.e(TAG, "Failed to start capture", e)
         }
     }
 
+    fun stopCamera() {
+        try {
+            captureSession?.close()
+            cameraDevice?.close()
+            imageReader?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping camera", e)
+        } finally {
+            captureSession = null
+            cameraDevice = null
+            imageReader = null
+            stopBackgroundThread()
+        }
+    }
+
+    private fun imageToByteArray(image: Image): ByteArray {
+        val planes = image.planes
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val data = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(data, 0, ySize)
+        vBuffer.get(data, ySize, vSize)
+        uBuffer.get(data, ySize + vSize, uSize)
+
+        return data
+    }
+
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        backgroundThread = HandlerThread("CameraThread").apply { start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
 
@@ -139,10 +193,11 @@ class CameraManager(
         backgroundThread?.quitSafely()
         try {
             backgroundThread?.join()
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Background thread interrupted", e)
+        } finally {
             backgroundThread = null
             backgroundHandler = null
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Error stopping background thread", e)
         }
     }
 }
